@@ -44,8 +44,7 @@ def init_db():
             )
         """)
         
-        # --- AUTOMATIC MIGRATION FOR EXISTING DATABASES ---
-        # Checks if 'time_taken_seconds' column exists from old versions, injects it if missing
+        # Automatic Migration for tracking seconds columns safely
         cursor = conn.execute("PRAGMA table_info(leaderboard)")
         columns = [row["name"] for row in cursor.fetchall()]
         if "time_taken_seconds" not in columns:
@@ -174,6 +173,8 @@ with tab_admin:
                             )
                             conn.commit()
                         st.success(f"Successfully deployed module '{new_quiz_name}' directly to persistent system database!")
+                        time.sleep(1)
+                        st.rerun()
                     except sqlite3.IntegrityError:
                         st.error("A quiz module with that exact title already exists.")
 
@@ -198,13 +199,39 @@ with tab_admin:
         else:
             st.info("No records compiled in historical dashboard ledger yet.")
             
-        # --- FEATURE 2: RESET LEADERBOARD PANEL ---
+        # --- DANGER ZONE: EXTENDED ADMINISTRATIVE CLEANUP TASKS ---
         st.write("---")
         st.subheader("⚠️ Danger Zone")
-        st.markdown("Clicking the button below completely clears out all user submission logs and scoreboards. *This cannot be undone.*")
         
-        # Confirmation flag to protect accidental deletion clicks
-        if st.checkbox("I confirm I want to clear the leaderboard data for all quizzes"):
+        # Pull live available quiz definitions to display inside target removal dropdowns
+        with get_db_connection() as conn:
+            current_quizzes_rows = conn.execute("SELECT quiz_name FROM quizzes").fetchall()
+        list_active_quizzes = [r["quiz_name"] for r in current_quizzes_rows]
+        
+        # NEW FEATURE 1: CLEAR AN EXISTING INDIVIDUAL QUIZ
+        st.markdown("#### Delete an Existing Quiz")
+        if list_active_quizzes:
+            selected_quiz_to_delete = st.selectbox("Select which quiz to permanently remove:", list_active_quizzes, key="del_quiz_select")
+            if st.checkbox(f"I confirm I want to completely delete '{selected_quiz_to_delete}' and all its scoring logs"):
+                if st.button("🗑️ Delete Selected Quiz"):
+                    with get_db_connection() as conn:
+                        # Clear out the quiz configuration metadata
+                        conn.execute("DELETE FROM quizzes WHERE quiz_name = ?", (selected_quiz_to_delete,))
+                        # Clear out student scores bound explicitly to this targeted assessment name
+                        conn.execute("DELETE FROM leaderboard WHERE quiz_name = ?", (selected_quiz_to_delete,))
+                        conn.commit()
+                    st.success(f"Successfully cleared out quiz '{selected_quiz_to_delete}' and clean swept matching logs!")
+                    time.sleep(1)
+                    st.rerun()
+        else:
+            st.info("No deployed quizzes found to delete.")
+            
+        st.markdown("---")
+        
+        # FEATURE 2: TOTAL RESET LEADERBOARD PANEL 
+        st.markdown("#### Reset All Scoreboards")
+        st.markdown("Clears out all associate score boards across every deployment while keeping quiz questions intact.")
+        if st.checkbox("I confirm I want to clear the leaderboard data for all quizzes completely"):
             if st.button("🔴 Wipe Leaderboard History"):
                 with get_db_connection() as conn:
                     conn.execute("DELETE FROM leaderboard")
@@ -298,9 +325,7 @@ with tab_quiz:
             submit_trigger = quiz_form.form_submit_button("Lock In & Submit Answers")
             
             if submit_trigger or remaining <= 0:
-                # --- FEATURE 1: CALCULATE COMPLETED TIMER DURATION ---
                 actual_time_spent = int(time.time() - st.session_state.start_time)
-                # Cap the time spent to the maximum allowed limit if they ran out of time
                 if actual_time_spent > total_limit:
                     actual_time_spent = total_limit
 
@@ -329,6 +354,8 @@ with tab_quiz:
     st.write("---")
     st.subheader("📊 Current Module Standings")
     
+    # NEW LOGIC LAYER FOR THE TIEBREAKER RANKS:
+    # SQL query orders first by SCORE DESCENDING (Highest wins), then by TIME_TAKEN_SECONDS ASCENDING (Lowest wins)
     with get_db_connection() as conn:
         all_scores = conn.execute(
             "SELECT quiz_name, associate_name, score, total_possible, time_taken_seconds FROM leaderboard ORDER BY score DESC, time_taken_seconds ASC, timestamp ASC"
@@ -342,7 +369,6 @@ with tab_quiz:
                 for row in all_scores:
                     if row["quiz_name"] == mod:
                         medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else "🔹"
-                        # Displaying score and completion time alongside name rankings
                         st.markdown(f"{medal} **Rank #{rank}** — {row['associate_name']} : `{row['score']} / {row['total_possible']} Points` (Time: `{row['time_taken_seconds']}s`)")
                         rank += 1
     else:
