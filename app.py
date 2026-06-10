@@ -4,6 +4,7 @@ import pypdf
 import time
 import random
 import sqlite3
+import json
 import pandas as pd
 import streamlit as st
 
