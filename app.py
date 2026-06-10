@@ -4,7 +4,7 @@ import pypdf
 import time
 import random
 import sqlite3
-import json
+import json  
 import pandas as pd
 import streamlit as st
 
@@ -39,9 +39,18 @@ def init_db():
                 associate_name TEXT,
                 score INTEGER,
                 total_possible INTEGER,
+                time_taken_seconds INTEGER,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        
+        # --- AUTOMATIC MIGRATION FOR EXISTING DATABASES ---
+        # Checks if 'time_taken_seconds' column exists from old versions, injects it if missing
+        cursor = conn.execute("PRAGMA table_info(leaderboard)")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if "time_taken_seconds" not in columns:
+            conn.execute("ALTER TABLE leaderboard ADD COLUMN time_taken_seconds INTEGER DEFAULT 0")
+            
         conn.commit()
 
 init_db()
@@ -85,7 +94,6 @@ def parse_stratos_pdf(pdf_file, target_num_q):
             
             for line in lines:
                 if line.startswith(f"Q{q_id}."):
-                    # Strip bracketed tags and question numbers cleanly
                     question_text = re.sub(r"\[.*?\]", "", line).replace(f"Q{q_id}.", "").strip()
                 elif line.startswith("A."):
                     options_dict["A"] = line.replace("A.", "").strip()
@@ -98,14 +106,12 @@ def parse_stratos_pdf(pdf_file, target_num_q):
                 elif not question_text and not line.startswith(("A.", "B.", "C.", "D.")) and "S5 Stratos" not in line:
                     question_text += " " + line
 
-            # Form structure validation
             if len(options_dict) >= 2 and q_id in answer_key_map:
                 correct_letter = answer_key_map[q_id]
                 correct_text_option = options_dict.get(correct_letter, "")
                 ordered_options = [options_dict.get(k, "") for k in sorted(options_dict.keys())]
                 
                 if correct_text_option:
-                    # FIX: Keep question_text totally isolated without attaching IDs/prefixes
                     parsed_questions.append({
                         "question": question_text.strip(),
                         "options": ordered_options,
@@ -174,13 +180,14 @@ with tab_admin:
         st.write("---")
         st.subheader("📊 Download Historical Leaderboards")
         
-        # Pull global scores database table straight into a Pandas DataFrame
         with get_db_connection() as conn:
-            df_leaderboard = pd.read_sql_query("SELECT quiz_name, associate_name, score, total_possible, timestamp FROM leaderboard ORDER BY timestamp DESC", conn)
+            df_leaderboard = pd.read_sql_query(
+                "SELECT quiz_name, associate_name, score, total_possible, time_taken_seconds, timestamp FROM leaderboard ORDER BY timestamp DESC", 
+                conn
+            )
             
         if not df_leaderboard.empty:
             st.dataframe(df_leaderboard)
-            # Convert to a clean downloadable CSV layout string
             csv_data = df_leaderboard.to_csv(index=False).encode('utf-8')
             st.download_button(
                 label="📥 Download Full Report (.CSV)",
@@ -190,6 +197,21 @@ with tab_admin:
             )
         else:
             st.info("No records compiled in historical dashboard ledger yet.")
+            
+        # --- FEATURE 2: RESET LEADERBOARD PANEL ---
+        st.write("---")
+        st.subheader("⚠️ Danger Zone")
+        st.markdown("Clicking the button below completely clears out all user submission logs and scoreboards. *This cannot be undone.*")
+        
+        # Confirmation flag to protect accidental deletion clicks
+        if st.checkbox("I confirm I want to clear the leaderboard data for all quizzes"):
+            if st.button("🔴 Wipe Leaderboard History"):
+                with get_db_connection() as conn:
+                    conn.execute("DELETE FROM leaderboard")
+                    conn.commit()
+                st.success("Leaderboard history has been successfully wiped clean!")
+                time.sleep(1)
+                st.rerun()
 
 # --- TAB 1: INTERACTIVE RUNTIME ASSOCIATE INTERFACE ---
 with tab_quiz:
@@ -202,7 +224,6 @@ with tab_quiz:
     else:
         st.write(f"👤 Associate: **{st.session_state.user_name}**")
         
-        # Load available saved modules directly from DB
         with get_db_connection() as conn:
             quiz_rows = conn.execute("SELECT quiz_id, quiz_name, time_per_q, num_questions FROM quizzes").fetchall()
             
@@ -213,15 +234,14 @@ with tab_quiz:
             quiz_options = {r["quiz_name"]: r for r in quiz_rows}
             selected_module = st.selectbox("Choose a quiz to start:", list(quiz_options.keys()))
             
-            # Query historical attempts specifically for this active player to block double takes
             with get_db_connection() as conn:
                 existing_attempt = conn.execute(
-                    "SELECT score FROM leaderboard WHERE quiz_name = ? AND associate_name = ?", 
+                    "SELECT score, time_taken_seconds FROM leaderboard WHERE quiz_name = ? AND associate_name = ?", 
                     (selected_module, st.session_state.user_name)
                 ).fetchone()
                 
             if existing_attempt:
-                st.warning(f"⚠️ You have already submitted this assessment. Your registered score: **{existing_attempt['score']}**")
+                st.warning(f"⚠️ You have already submitted this assessment. Registered score: **{existing_attempt['score']}** (Time spent: `{existing_attempt['time_taken_seconds']}s`)")
             else:
                 target_meta = quiz_options[selected_module]
                 total_time_calc = target_meta["num_questions"] * target_meta["time_per_q"]
@@ -245,7 +265,6 @@ with tab_quiz:
                     st.session_state.start_time = time.time()
                     st.rerun()
         else:
-            # --- ACTIVE RUNNING ASSESSMENT PANEL ---
             active_data = st.session_state.current_quiz
             total_limit = active_data["time_limit"]
             
@@ -254,25 +273,20 @@ with tab_quiz:
             
             if remaining <= 0:
                 st.error("💥 Time-limit window exceeded! Auto-submitting current answers...")
-                # Fallthrough evaluates form choices instantly
                 remaining = 0
                 
             st.metric(label="⌛ Overall Time Remaining", value=f"{remaining} Seconds")
             
-            # Inject empty refresh block to ensure clock cycles display accurately
             st.empty()
             if remaining > 0:
-                time.sleep(1) # Ticks view engine
+                time.sleep(1) 
                 
-            # RENDER QUESTIONS FORM
             quiz_form = st.form(key="active_test_form")
             user_selections = {}
             
             for idx, q_meta in enumerate(active_data["questions"]):
-                # Clean prompt mapping layout
                 quiz_form.markdown(f"**Question {idx+1}:** {q_meta['question']}")
                 
-                # FIX: Prepend a completely blank option so no choices are auto-selected by default
                 form_choices = ["Select an option..."] + q_meta["options"]
                 user_selections[idx] = quiz_form.selectbox(
                     "Choose the correct option:",
@@ -284,24 +298,27 @@ with tab_quiz:
             submit_trigger = quiz_form.form_submit_button("Lock In & Submit Answers")
             
             if submit_trigger or remaining <= 0:
+                # --- FEATURE 1: CALCULATE COMPLETED TIMER DURATION ---
+                actual_time_spent = int(time.time() - st.session_state.start_time)
+                # Cap the time spent to the maximum allowed limit if they ran out of time
+                if actual_time_spent > total_limit:
+                    actual_time_spent = total_limit
+
                 final_score = 0
                 for idx, q_meta in enumerate(active_data["questions"]):
-                    # If they skipped it or ran out of time, user_selections[idx] will be "Select an option..."
                     if user_selections[idx] == q_meta["correct"]:
                         final_score += 1
                         
-                # WRITE DIRECTLY TO SYSTEM STORAGE FILE
                 with get_db_connection() as conn:
                     conn.execute(
-                        "INSERT INTO leaderboard (quiz_name, associate_name, score, total_possible) VALUES (?, ?, ?, ?)",
-                        (active_data["name"], st.session_state.user_name, final_score, len(active_data["questions"]))
+                        "INSERT INTO leaderboard (quiz_name, associate_name, score, total_possible, time_taken_seconds) VALUES (?, ?, ?, ?, ?)",
+                        (active_data["name"], st.session_state.user_name, final_score, len(active_data["questions"]), actual_time_spent)
                     )
                     conn.commit()
                 
                 st.balloons()
-                st.success(f"Assessment complete! Score written to central storage: {final_score} / {len(active_data['questions'])}")
+                st.success(f"Assessment complete! Score written to central storage: {final_score} / {len(active_data['questions'])} (Completed in {actual_time_spent} seconds)")
                 
-                # Reset Session States safely
                 st.session_state.quiz_started = False
                 st.session_state.current_quiz = None
                 if "start_time" in st.session_state:
@@ -314,11 +331,10 @@ with tab_quiz:
     
     with get_db_connection() as conn:
         all_scores = conn.execute(
-            "SELECT quiz_name, associate_name, score, total_possible FROM leaderboard ORDER BY score DESC, timestamp ASC"
+            "SELECT quiz_name, associate_name, score, total_possible, time_taken_seconds FROM leaderboard ORDER BY score DESC, time_taken_seconds ASC, timestamp ASC"
         ).fetchall()
         
     if all_scores:
-        # Group by active quiz module titles for clean segmented viewing
         modules_tracked = set([row["quiz_name"] for row in all_scores])
         for mod in modules_tracked:
             with st.expander(f"🏆 Rankings: {mod}", expanded=True):
@@ -326,7 +342,8 @@ with tab_quiz:
                 for row in all_scores:
                     if row["quiz_name"] == mod:
                         medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else "🔹"
-                        st.markdown(f"{medal} **Rank #{rank}** — {row['associate_name']} : `{row['score']} / {row['total_possible']} Points`")
+                        # Displaying score and completion time alongside name rankings
+                        st.markdown(f"{medal} **Rank #{rank}** — {row['associate_name']} : `{row['score']} / {row['total_possible']} Points` (Time: `{row['time_taken_seconds']}s`)")
                         rank += 1
     else:
         st.info("No associate results recorded yet.")
