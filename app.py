@@ -87,17 +87,14 @@ def parse_and_split_pdf(pdf_file, q_per_quiz, time_limit_q):
 
         # 1. Parse Answer Key from the back using loose spacing tolerances
         answer_key_map = {}
-        # Matches patterns like Q001: B, Q1: A, Q151: B with any number of spaces
         ans_pattern = re.compile(r"Q\??0*(\d+):\s*([A-D])", re.IGNORECASE)
         for match in ans_pattern.finditer(full_text):
             q_num = int(match.group(1))
             correct_letter = match.group(2).upper()
             answer_key_map[q_num] = correct_letter
 
-        # 2. Tokenize questions based on Q followed by numbers and a delimiter (dot, space, bracket)
-        # Regex split catches 'Q1.', 'Q 1.', 'Q150.' dynamically
+        # 2. Tokenize questions based on Q followed by numbers and a delimiter
         q_blocks = re.split(r"(?=Q\s*\d+\s*[\.\s\]\)])", full_text)
-        
         all_ordered_questions = []
         
         for block in q_blocks:
@@ -105,25 +102,19 @@ def parse_and_split_pdf(pdf_file, q_per_quiz, time_limit_q):
             if not cleaned_block.startswith("Q"):
                 continue
                 
-            # Isolate the index identification number
             num_match = re.match(r"^Q\s*(\d+)", cleaned_block, re.IGNORECASE)
             if not num_match:
                 continue
             q_id = int(num_match.group(1))
 
-            # Split lines cleanly and ignore watermark headers
             lines = [line.strip() for line in cleaned_block.split("\n") if line.strip()]
-            
             question_text = ""
             options_dict = {}
             
-            # Read line item sequences
             for line in lines:
-                # Filter out operational branding footnotes
                 if "S5 Stratos" in line and ("Operations" in line or "Training" in line or "Page" in line or "Practice Questions" in line):
                     continue
                 
-                # Loose detection for choices (A., A), B., B))
                 if re.match(r"^[A]\s*[\.\s\)]", line, re.IGNORECASE):
                     options_dict["A"] = re.sub(r"^[A]\s*[\.\s\)]", "", line).strip()
                 elif re.match(r"^[B]\s*[\.\s\)]", line, re.IGNORECASE):
@@ -133,7 +124,6 @@ def parse_and_split_pdf(pdf_file, q_per_quiz, time_limit_q):
                 elif re.match(r"^[D]\s*[\.\s\)]", line, re.IGNORECASE):
                     options_dict["D"] = re.sub(r"^[D]\s*[\.\s\)]", "", line).strip()
                 else:
-                    # Strip out initial metadata tags to keep question content pristine
                     cleaned_line = re.sub(r"^Q\s*\d+\s*[\.\s\]\)]", "", line, flags=re.IGNORECASE)
                     cleaned_line = re.sub(r"\[.*?\]", "", cleaned_line).strip()
                     if cleaned_line:
@@ -142,7 +132,6 @@ def parse_and_split_pdf(pdf_file, q_per_quiz, time_limit_q):
                         else:
                             question_text += " " + cleaned_line
 
-            # Fallback evaluation matching if answer key contains the index
             if len(options_dict) >= 2 and q_id in answer_key_map:
                 correct_letter = answer_key_map[q_id]
                 correct_text_option = options_dict.get(correct_letter, "")
@@ -157,14 +146,11 @@ def parse_and_split_pdf(pdf_file, q_per_quiz, time_limit_q):
                         "correct_letter": correct_letter
                     })
 
-        # Final tracking assembly validation
         if not all_ordered_questions:
-            st.error("Could not construct structured segments from target document mapping tokens. Ensure your PDF matches standard question layout specifications.")
+            st.error("Could not construct structured segments from target document mapping tokens.")
             return False
 
-        # Sort everything sequentially by original index before chunk partitioning
         all_ordered_questions.sort(key=lambda x: x["pdf_num"])
-
         total_extracted = len(all_ordered_questions)
         quiz_counter = 1
         
@@ -244,7 +230,6 @@ with tab_admin:
                     st.markdown(f"**{q_row['quiz_name']}** ({len(json.loads(q_row['questions_json']))} Questions)")
                 
                 with col_status:
-                    current_status = "Enabled" if q_row["is_enabled"] == 1 else "Disabled"
                     toggle_label = "Disable" if q_row["is_enabled"] == 1 else "Enable"
                     
                     if st.button(toggle_label, key=f"tgl_{q_row['quiz_name']}"):
@@ -327,6 +312,7 @@ with tab_quiz:
             selection_map = {r["quiz_name"]: r for r in enabled_rows}
             user_choice = st.selectbox("Choose an open module window to execute:", list(selection_map.keys()))
             
+            # ST_RULE CHECK: Enforce strictly one attempt per unique email account profile
             with get_db_connection() as conn:
                 duplicate_check = conn.execute(
                     "SELECT score, time_taken_seconds FROM leaderboard WHERE quiz_name = ? AND associate_email = ?",
@@ -334,36 +320,28 @@ with tab_quiz:
                 ).fetchone()
                 
             if duplicate_check:
-                st.warning(f"⚠️ Registration Conflict: You have already submitted entries for this quiz. Confirmed score: **{duplicate_check['score']}** | Duration: `{duplicate_check['time_taken_seconds']}s`")
+                st.error(f"❌ Access Denied: You have already submitted an entry for this quiz module. Registered score: {duplicate_check['score']} | Time taken: {duplicate_check['time_taken_seconds']}s. Only 1 attempt is allowed.")
             else:
                 meta_block = selection_map[user_choice]
                 q_array = json.loads(meta_block["questions_json"])
                 calculated_max_time = len(q_array) * meta_block["time_per_q"]
                 
                 st.markdown(f"""
-                **Module Operational Framework Parameters:**
+                **Module Operational Parameters:**
                 * Active Assessment Identifier: `{meta_block['quiz_name']}`
                 * Segment Size: `{len(q_array)} Multiple Choice Questions`
-                * Maximum Permitted Session Runway: `{calculated_max_time} Seconds Total`
+                * Maximum Permitted Runway: `{calculated_max_time} Seconds Total`
                 """)
                 
-                # DETERMINISTIC TIME-LOCK LOGIC FOR MON-FRI (09:00 AM - 05:00 PM)
-                now = datetime.datetime.now()
-                is_weekday = now.weekday() in [0, 1, 2, 3, 4]
-                is_work_hours = 9 <= now.hour < 17 
-                
-                if not is_weekday or not is_work_hours:
-                    st.error("🔒 Security Lock: This system's quizzes are restricted to execution cycles between Monday and Friday from 09:00 AM to 05:00 PM.")
-                else:
-                    if st.button("🚀 Begin Assessment Session"):
-                        st.session_state.active_quiz_run = {
-                            "name": meta_block["quiz_name"],
-                            "time_limit": calculated_max_time,
-                            "questions": q_array
-                        }
-                        st.session_state.quiz_started = True
-                        st.session_state.start_time = time.time()
-                        st.rerun()
+                if st.button("🚀 Begin Assessment Session"):
+                    st.session_state.active_quiz_run = {
+                        "name": meta_block["quiz_name"],
+                        "time_limit": calculated_max_time,
+                        "questions": q_array
+                    }
+                    st.session_state.quiz_started = True
+                    st.session_state.start_time = time.time()
+                    st.rerun()
         else:
             # --- LIVE TESTING EXECUTION MODULE ENGINE ---
             run_data = st.session_state.active_quiz_run
@@ -373,7 +351,7 @@ with tab_quiz:
             remaining_seconds = max_seconds - seconds_spent
             
             if remaining_seconds <= 0:
-                st.error("💥 runtime limits have expired! Locking entries...")
+                st.error("💥 Time limit expired! Locking choices and submitting answers...")
                 remaining_seconds = 0
                 
             st.metric(label="⌛ Time Remaining in Active Module Window", value=f"{remaining_seconds} Seconds")
