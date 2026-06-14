@@ -242,11 +242,12 @@ with tab_admin:
                 with col_slack:
                     if st.checkbox("Generate Slack Keys", key=f"key_chk_{q_row['quiz_name']}"):
                         questions_list = json.loads(q_row["questions_json"])
-                        slack_text = f"*Answer Key Report for {q_row['quiz_name']}*\n```\n"
+                        slack_text = f"*Answer Key Report for {q_row['quiz_name']}*\n"
+                        # CHANGED: Now appends the complete question text safely formatted into read-only
                         for idx, item in enumerate(questions_list):
-                            slack_text += f"Q{idx+1} (PDF Q{item['pdf_num']}): {item['correct_letter']}) {item['correct']}\n"
-                        slack_text += "```"
-                        st.text_area("Copy Text for Slack:", value=slack_text, height=100, key=f"txt_{q_row['quiz_name']}")
+                            slack_text += f"\n*Q{idx+1}. {item['question']}*\n👉 Answer: `{item['correct_letter']}) {item['correct']}`\n"
+                        
+                        st.text_area("Copy Text for Slack (Read-Only):", value=slack_text, height=150, key=f"txt_{q_row['quiz_name']}", disabled=True)
         else:
             st.info("No compiled quiz segments found in local storage.")
 
@@ -267,7 +268,8 @@ with tab_admin:
                     slack_board_output += f"{medal} *Rank #{rank_idx}* — {row['associate_email']} | Score: `{row['score']}/{row['total_possible']}` | Time: `{row['time_taken_seconds']}s`\n"
                     rank_idx += 1
                     
-            st.text_area("Click below to copy and paste directly into Slack:", value=slack_board_output, height=150)
+            # CHANGED: Added disabled=True to lock edits on leaderboard texts as well
+            st.text_area("Click below to copy and paste directly into Slack (Read-Only):", value=slack_board_output, height=150, disabled=True)
         else:
             st.info("No recorded historical scores available.")
 
@@ -312,7 +314,6 @@ with tab_quiz:
             selection_map = {r["quiz_name"]: r for r in enabled_rows}
             user_choice = st.selectbox("Choose an open module window to execute:", list(selection_map.keys()))
             
-            # ST_RULE CHECK: Enforce strictly one attempt per unique email account profile
             with get_db_connection() as conn:
                 duplicate_check = conn.execute(
                     "SELECT score, time_taken_seconds FROM leaderboard WHERE quiz_name = ? AND associate_email = ?",
