@@ -19,7 +19,7 @@ def get_db_connection():
     return conn
 
 def init_db():
-    """Initializes schema to handle sequential multi-quiz blocks and clears structure anomalies."""
+    """Initializes schema to handle quiz blocks, leaderboards, and associate user accounts."""
     with get_db_connection() as conn:
         # Table to store generated quiz segments
         conn.execute("""
@@ -32,9 +32,18 @@ def init_db():
             )
         """)
         
-        # Safe table execution reset
+        # Table to store unique user credentials
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE,
+                password TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Safe table execution reset for leaderboard
         try:
-            # Table to store associate execution tracking logs
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS leaderboard (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,13 +56,12 @@ def init_db():
                 )
             """)
             
-            # Verify columns directly to completely eliminate SQLite Operational Errors
+            # Verify columns directly to eliminate SQLite Operational Errors
             cursor = conn.execute("PRAGMA table_info(leaderboard)")
             columns = [row["name"] for row in cursor.fetchall()]
             if "time_taken_seconds" not in columns:
                 conn.execute("ALTER TABLE leaderboard ADD COLUMN time_taken_seconds INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
-            # If the database file is corrupted or structurally locked, drop and rebuild clean
             conn.execute("DROP TABLE IF EXISTS leaderboard")
             conn.execute("""
                 CREATE TABLE leaderboard (
@@ -243,7 +251,6 @@ with tab_admin:
                     if st.checkbox("Generate Slack Keys", key=f"key_chk_{q_row['quiz_name']}"):
                         questions_list = json.loads(q_row["questions_json"])
                         slack_text = f"*Answer Key Report for {q_row['quiz_name']}*\n"
-                        # CHANGED: Now appends the complete question text safely formatted into read-only
                         for idx, item in enumerate(questions_list):
                             slack_text += f"\n*Q{idx+1}. {item['question']}*\n👉 Answer: `{item['correct_letter']}) {item['correct']}`\n"
                         
@@ -268,19 +275,19 @@ with tab_admin:
                     slack_board_output += f"{medal} *Rank #{rank_idx}* — {row['associate_email']} | Score: `{row['score']}/{row['total_possible']}` | Time: `{row['time_taken_seconds']}s`\n"
                     rank_idx += 1
                     
-            # CHANGED: Added disabled=True to lock edits on leaderboard texts as well
             st.text_area("Click below to copy and paste directly into Slack (Read-Only):", value=slack_board_output, height=150, disabled=True)
         else:
             st.info("No recorded historical scores available.")
 
         st.write("---")
         st.subheader("🗑️ System Infrastructure Reset")
-        if st.checkbox("Confirm permanent deletion of all Leaderboard records"):
-            if st.button("🔴 Wipe System Performance Database"):
+        if st.checkbox("Confirm permanent deletion of database registers"):
+            if st.button("🔴 Wipe System Performance & User Registers"):
                 with get_db_connection() as conn:
                     conn.execute("DELETE FROM leaderboard")
+                    conn.execute("DELETE FROM users")
                     conn.commit()
-                st.success("Leaderboard history has been successfully reset!")
+                st.success("Leaderboard history and user access registers successfully wiped!")
                 st.rerun()
 
 # --- TAB 1: RUNTIME ASSOCIATE INTERFACE SYSTEM ---
@@ -288,17 +295,43 @@ with tab_quiz:
     st.markdown("### S5 Stratos Retail Quiz")
     
     if not st.session_state.user_email:
-        st.subheader("Associate Authentication Entry")
-        email_input = st.text_input("Enter your S5 stratos email id:")
-        if st.button("Establish Session Profile") and email_input.strip():
-            if "@" in email_input and "." in email_input:
-                st.session_state.user_email = email_input.strip().lower()
-                st.rerun()
+        st.subheader("Associate Authentication Portal")
+        
+        email_input = st.text_input("Enter your S5 Stratos Email ID:").strip().lower()
+        password_input = st.text_input("Enter your Password:", type="password")
+        
+        if email_input:
+            if "@" not in email_input or "." not in email_input:
+                st.warning("Please enter a valid structure email account profile.")
             else:
-                st.error("Please enter a valid email address.")
+                # Query user mapping index from localized schema setup
+                with get_db_connection() as conn:
+                    existing_user = conn.execute("SELECT * FROM users WHERE email = ?", (email_input,)).fetchone()
+                
+                if existing_user:
+                    st.info("👋 Returning User Profile Found. Enter your password to log in.")
+                    if st.button("🔐 Authenticate and Sign In"):
+                        if existing_user["password"] == password_input:
+                            st.session_state.user_email = email_input
+                            st.success("Authentication confirmed!")
+                            st.rerun()
+                        else:
+                            st.error("Incorrect password credentials provided. Please try again.")
+                else:
+                    st.warning("✨ New Profile detected. The password entered below will be saved as your credential for future sign-ins.")
+                    if st.button("📝 Register Account Profile"):
+                        if len(password_input) < 4:
+                            st.error("For basic security protections, password inputs must be at least 4 characters long.")
+                        else:
+                            with get_db_connection() as conn:
+                                conn.execute("INSERT INTO users (email, password) VALUES (?, ?)", (email_input, password_input))
+                                conn.commit()
+                            st.session_state.user_email = email_input
+                            st.success("Account profile successfully secured and logged in!")
+                            st.rerun()
     else:
         st.sidebar.markdown(f"👤 Session User: `{st.session_state.user_email}`")
-        if st.sidebar.button("Switch Account Profiler"):
+        if st.sidebar.button("Log Out of Session"):
             st.session_state.user_email = ""
             st.session_state.quiz_started = False
             st.session_state.active_quiz_run = None
@@ -314,6 +347,7 @@ with tab_quiz:
             selection_map = {r["quiz_name"]: r for r in enabled_rows}
             user_choice = st.selectbox("Choose an open module window to execute:", list(selection_map.keys()))
             
+            # ST_RULE CHECK: Enforce strictly one attempt per unique email account profile
             with get_db_connection() as conn:
                 duplicate_check = conn.execute(
                     "SELECT score, time_taken_seconds FROM leaderboard WHERE quiz_name = ? AND associate_email = ?",
