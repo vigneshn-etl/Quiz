@@ -19,7 +19,7 @@ def get_db_connection():
     return conn
 
 def init_db():
-    """Initializes schema to handle quiz blocks, leaderboards, and associate user accounts."""
+    """Initializes schema to handle quiz blocks, leaderboards, and associate user accounts with recovery keys."""
     with get_db_connection() as conn:
         # Table to store generated quiz segments
         conn.execute("""
@@ -32,16 +32,29 @@ def init_db():
             )
         """)
         
-        # Table to store unique user credentials
+        # Table to store unique user credentials along with recovery data
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 email TEXT UNIQUE,
                 password TEXT,
+                security_question TEXT,
+                security_answer TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
+        # Database Migrator: Ensure existing databases seamlessly get recovery columns without crashing
+        try:
+            cursor = conn.execute("PRAGMA table_info(users)")
+            columns = [row["name"] for row in cursor.fetchall()]
+            if "security_question" not in columns:
+                conn.execute("ALTER TABLE users ADD COLUMN security_question TEXT DEFAULT 'What is your favorite color?'")
+            if "security_answer" not in columns:
+                conn.execute("ALTER TABLE users ADD COLUMN security_answer TEXT DEFAULT 'blue'")
+        except sqlite3.OperationalError:
+            pass
+
         # Safe table execution reset for leaderboard
         try:
             conn.execute("""
@@ -56,7 +69,6 @@ def init_db():
                 )
             """)
             
-            # Verify columns directly to eliminate SQLite Operational Errors
             cursor = conn.execute("PRAGMA table_info(leaderboard)")
             columns = [row["name"] for row in cursor.fetchall()]
             if "time_taken_seconds" not in columns:
@@ -182,6 +194,15 @@ def parse_and_split_pdf(pdf_file, q_per_quiz, time_limit_q):
         st.error(f"Partition setup execution crash: {e}")
         return False
 
+# --- SECURITY QUESTIONS REGISTER ---
+SECURITY_QUESTIONS = [
+    "What was the name of your first pet?",
+    "What is your mother's maiden name?",
+    "In what city or town did your parents meet?",
+    "What was the name of your elementary school?",
+    "What was your first car model?"
+]
+
 # --- SYSTEM STATE RETENTION ENGINE ---
 if "user_email" not in st.session_state:
     st.session_state.user_email = ""
@@ -298,18 +319,19 @@ with tab_quiz:
         st.subheader("Associate Authentication Portal")
         
         email_input = st.text_input("Enter your S5 Stratos Email ID:").strip().lower()
-        password_input = st.text_input("Enter your Password:", type="password")
         
         if email_input:
             if "@" not in email_input or "." not in email_input:
                 st.warning("Please enter a valid structure email account profile.")
             else:
-                # Query user mapping index from localized schema setup
                 with get_db_connection() as conn:
                     existing_user = conn.execute("SELECT * FROM users WHERE email = ?", (email_input,)).fetchone()
                 
+                # --- SCENARIO A: LOGGING IN EXISTING REGISTERED USER ---
                 if existing_user:
                     st.info("👋 Returning User Profile Found. Enter your password to log in.")
+                    password_input = st.text_input("Enter your Password:", type="password", key="login_pwd_input")
+                    
                     if st.button("🔐 Authenticate and Sign In"):
                         if existing_user["password"] == password_input:
                             st.session_state.user_email = email_input
@@ -317,14 +339,45 @@ with tab_quiz:
                             st.rerun()
                         else:
                             st.error("Incorrect password credentials provided. Please try again.")
+                    
+                    # --- PASSWORD RESET WORKFLOW LAYER ---
+                    st.write("---")
+                    with st.expander("🔑 Forgot Password? Reset via Security Question"):
+                        st.markdown(f"**Security Question Challenge:** *{existing_user['security_question']}*")
+                        recovery_answer = st.text_input("Your Security Answer:", key="reset_ans_input").strip().lower()
+                        new_password_input = st.text_input("Choose New Password:", type="password", key="reset_new_pwd")
+                        
+                        if st.button("🔄 Update Password Credentials"):
+                            if existing_user["security_answer"].strip().lower() != recovery_answer:
+                                st.error("The verification answer provided does not match our records.")
+                            elif len(new_password_input) < 4:
+                                st.error("New password must be at least 4 characters long.")
+                            else:
+                                with get_db_connection() as conn:
+                                    conn.execute("UPDATE users SET password = ? WHERE email = ?", (new_password_input, email_input))
+                                    conn.commit()
+                                st.success("Password successfully reset! You can now log in above using your new credential.")
+                                time.sleep(1)
+                                st.rerun()
+
+                # --- SCENARIO B: REGISTERING NEW ACCOUNT PROFILE ---
                 else:
-                    st.warning("✨ New Profile detected. The password entered below will be saved as your credential for future sign-ins.")
+                    st.warning("✨ New Profile detected. Configure your initial login and account safety settings below.")
+                    reg_password = st.text_input("Create Account Password:", type="password", key="reg_pwd")
+                    reg_question = st.selectbox("Select a Password Recovery Security Question:", SECURITY_QUESTIONS)
+                    reg_answer = st.text_input("Provide the Answer (Case-Insensitive):", key="reg_ans").strip().lower()
+                    
                     if st.button("📝 Register Account Profile"):
-                        if len(password_input) < 4:
+                        if len(reg_password) < 4:
                             st.error("For basic security protections, password inputs must be at least 4 characters long.")
+                        elif not reg_answer:
+                            st.error("You must provide an answer to your selected security question for account recovery functionality.")
                         else:
                             with get_db_connection() as conn:
-                                conn.execute("INSERT INTO users (email, password) VALUES (?, ?)", (email_input, password_input))
+                                conn.execute(
+                                    "INSERT INTO users (email, password, security_question, security_answer) VALUES (?, ?, ?, ?)", 
+                                    (email_input, reg_password, reg_question, reg_answer)
+                                )
                                 conn.commit()
                             st.session_state.user_email = email_input
                             st.success("Account profile successfully secured and logged in!")
