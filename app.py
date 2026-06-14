@@ -2,15 +2,15 @@ import os
 import re
 import pypdf
 import time
-import random
-import sqlite3
 import json  
+import sqlite3
+import datetime
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="S5 Stratos Enterprise Portal", layout="centered")
+st.set_page_config(page_title="S5 Stratos Retail Quiz", layout="centered")
 
-# --- DATABASE SETUP & MIGRATION LAYER ---
+# --- DATABASE LAYER & CONFIGURATION ---
 DB_FILE = "quiz_data.db"
 
 def get_db_connection():
@@ -19,44 +19,37 @@ def get_db_connection():
     return conn
 
 def init_db():
-    """Creates tables for persistent quizzes and leaderboards if they don't exist."""
+    """Initializes schema to handle sequential multi-quiz blocks and multi-tier leaderboards."""
     with get_db_connection() as conn:
-        # Table to store unique quiz metadata
+        # Table to store generated quiz segments
         conn.execute("""
             CREATE TABLE IF NOT EXISTS quizzes (
                 quiz_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 quiz_name TEXT UNIQUE,
-                time_per_q INTEGER,
-                num_questions INTEGER,
-                questions_json TEXT
+                questions_json TEXT,
+                is_enabled INTEGER DEFAULT 0,
+                time_per_q INTEGER DEFAULT 20
             )
         """)
-        # Table to store associate attempts permanently
+        # Table to store associate execution tracking logs
         conn.execute("""
             CREATE TABLE IF NOT EXISTS leaderboard (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 quiz_name TEXT,
-                associate_name TEXT,
+                associate_email TEXT,
                 score INTEGER,
                 total_possible INTEGER,
                 time_taken_seconds INTEGER,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
-        # Automatic Migration for tracking seconds columns safely
-        cursor = conn.execute("PRAGMA table_info(leaderboard)")
-        columns = [row["name"] for row in cursor.fetchall()]
-        if "time_taken_seconds" not in columns:
-            conn.execute("ALTER TABLE leaderboard ADD COLUMN time_taken_seconds INTEGER DEFAULT 0")
-            
         conn.commit()
 
 init_db()
 
-# --- DETERMINISTIC S5 STRATOS PDF PARSER ---
-def parse_stratos_pdf(pdf_file, target_num_q):
-    """Parses S5_Stratos_250_Questions.pdf layout natively without cloud wrappers."""
+# --- DETERMINISTIC PDF CHUNK PARSER ---
+def parse_and_split_pdf(pdf_file, q_per_quiz, time_limit_q):
+    """Parses full PDF sequentially and chunks questions into Quiz 001, Quiz 002... without overlap."""
     try:
         reader = pypdf.PdfReader(pdf_file)
         full_text = ""
@@ -66,27 +59,31 @@ def parse_stratos_pdf(pdf_file, target_num_q):
                 full_text += text_content + "\n"
 
         if not full_text.strip():
-            return []
+            st.error("No readable text layers detected inside the target PDF.")
+            return False
 
-        # Parse Answer Key
+        # Parse Answer Key Mapping Matrix
         answer_key_map = {}
         ans_pattern = re.compile(r"Q\??(\d+):\s*([A-D])")
         for match in ans_pattern.finditer(full_text):
             answer_key_map[int(match.group(1))] = match.group(2)
 
-        # Tokenize question blocks
+        # Parse out all individual question structures sequentially
         q_blocks = re.split(r"(?=Q\d+\.)", full_text)
-        parsed_questions = []
+        all_ordered_questions = []
 
+        # Sort blocks sequentially by their parsed index number
+        sorted_blocks = []
         for block in q_blocks:
             if not block.strip().startswith("Q"):
                 continue
-                
             num_match = re.search(r"^Q(\d+)\.", block)
-            if not num_match:
-                continue
-            q_id = int(num_match.group(1))
+            if num_match:
+                sorted_blocks.append((int(num_match.group(1)), block))
+        
+        sorted_blocks.sort(key=lambda x: x[0])
 
+        for q_id, block in sorted_blocks:
             lines = [line.strip() for line in block.split("\n") if line.strip()]
             question_text = ""
             options_dict = {}
@@ -111,265 +108,348 @@ def parse_stratos_pdf(pdf_file, target_num_q):
                 ordered_options = [options_dict.get(k, "") for k in sorted(options_dict.keys())]
                 
                 if correct_text_option:
-                    parsed_questions.append({
+                    all_ordered_questions.append({
+                        "pdf_num": q_id,
                         "question": question_text.strip(),
                         "options": ordered_options,
-                        "correct": correct_text_option
+                        "correct": correct_text_option,
+                        "correct_letter": correct_letter
                     })
 
-        random.shuffle(parsed_questions)
-        return parsed_questions[:target_num_q]
-    except Exception as e:
-        st.error(f"Parsing engine exception: {e}")
-        return []
+        if not all_ordered_questions:
+            st.error("Could not construct structured segments from target document mapping tokens.")
+            return False
 
-# --- CORE STATE COMPONENT VARIABLES ---
-if "user_name" not in st.session_state:
-    st.session_state.user_name = ""
+        # Sequential Chunk Splitting Logic Execution
+        total_extracted = len(all_ordered_questions)
+        quiz_counter = 1
+        
+        with get_db_connection() as conn:
+            # Clear historical quiz setups prior to running a full partition reset
+            conn.execute("DELETE FROM quizzes")
+            
+            for i in range(0, total_extracted, q_per_quiz):
+                chunk = all_ordered_questions[i:i + q_per_quiz]
+                name_string = f"Quiz {quiz_counter:03d}"
+                
+                conn.execute(
+                    "INSERT INTO quizzes (quiz_name, questions_json, is_enabled, time_per_q) VALUES (?, ?, ?, ?)",
+                    (name_string, json.dumps(chunk), 0, time_limit_q)
+                )
+                quiz_counter += 1
+            conn.commit()
+            
+        st.success(f"Successfully split {total_extracted} questions into {quiz_counter - 1} distinct evaluation segments!")
+        return True
+    except Exception as e:
+        st.error(f"Partition setup execution crash: {e}")
+        return False
+
+# --- SYSTEM STATE RETENTION ENGINE ---
+if "user_email" not in st.session_state:
+    st.session_state.user_email = ""
 if "admin_logged_in" not in st.session_state:
     st.session_state.admin_logged_in = False
-if "current_quiz" not in st.session_state:
-    st.session_state.current_quiz = None
+if "active_quiz_run" not in st.session_state:
+    st.session_state.active_quiz_run = None
 if "quiz_started" not in st.session_state:
     st.session_state.quiz_started = False
 
-# --- APP LAYOUT NAVIGATION ---
-st.title("🏆 S5 Stratos Enterprise Quiz Portal")
+# --- FRONTEND INTERFACE VIEW TABS ---
 tab_quiz, tab_admin = st.tabs(["✏️ Take Quiz", "🔐 Admin Dashboard"])
 
-# --- TAB 2: PERSISTENT ADMIN CONTROL CENTER ---
+# --- TAB 2: SYSTEM ADMINISTRATION MODULES ---
 with tab_admin:
-    st.header("Admin Settings")
+    st.header("Admin Control Center")
     if not st.session_state.admin_logged_in:
         with st.form("admin_login"):
             u = st.text_input("Username")
             p = st.text_input("Password", type="password")
-            if st.form_submit_button("Login") and u == "admin" and p == "admin":
+            if st.form_submit_button("Authenticate Portal") and u == "admin" and p == "admin":
                 st.session_state.admin_logged_in = True
                 st.rerun()
     else:
-        st.success("🟢 System Administrator Session Active")
-        if st.button("Log Out"):
+        st.success("🟢 Administrator Authentication Active")
+        if st.button("Exit Session Control"):
             st.session_state.admin_logged_in = False
             st.rerun()
             
         st.write("---")
-        st.subheader("📁 Deploy a New Quiz Module")
+        st.subheader("⚙️ Step 1: Initialize & Partition Question Bank PDF")
         
-        new_quiz_name = st.text_input("Quiz Module Title (e.g., Inventory Optimization Module 1)")
-        adm_num_q = st.number_input("Number of questions to pull:", min_value=1, max_value=100, value=10)
-        adm_time_q = st.number_input("Time limit per question (seconds):", min_value=5, max_value=120, value=20)
-        adm_file = st.file_uploader("Upload Stratos Question Bank (PDF)", type="pdf", key="adm_file_loader")
+        adm_q_per_quiz = st.number_input("Questions per quiz segment:", min_value=5, max_value=50, value=25)
+        adm_time_per_q = st.number_input("Time allocation per question (seconds):", min_value=5, max_value=120, value=20)
+        source_file = st.file_uploader("Upload 'S5_Stratos_250_Questions.pdf'", type="pdf")
         
-        if st.button("Compile & Save Module") and new_quiz_name and adm_file:
-            with st.spinner("Processing PDF data streams..."):
-                extracted_list = parse_stratos_pdf(adm_file, adm_num_q)
-                if extracted_list:
-                    try:
-                        with get_db_connection() as conn:
-                            conn.execute(
-                                "INSERT INTO quizzes (quiz_name, time_per_q, num_questions, questions_json) VALUES (?, ?, ?, ?)",
-                                (new_quiz_name.strip(), adm_time_q, len(extracted_list), json.dumps(extracted_list))
-                            )
-                            conn.commit()
-                        st.success(f"Successfully deployed module '{new_quiz_name}' directly to persistent system database!")
-                        time.sleep(1)
-                        st.rerun()
-                    except sqlite3.IntegrityError:
-                        st.error("A quiz module with that exact title already exists.")
+        if st.button("Parse and Construct Sequential Quizzes") and source_file:
+            if parse_and_split_pdf(source_file, adm_q_per_quiz, adm_time_per_q):
+                st.rerun()
 
         st.write("---")
-        st.subheader("📊 Download Historical Leaderboards")
+        st.subheader("🔓 Step 2: Manage Quiz Availability & Fetch Slack Output")
         
         with get_db_connection() as conn:
-            df_leaderboard = pd.read_sql_query(
-                "SELECT quiz_name, associate_name, score, total_possible, time_taken_seconds, timestamp FROM leaderboard ORDER BY timestamp DESC", 
-                conn
-            )
+            all_quizzes_rows = conn.execute("SELECT * FROM quizzes ORDER BY quiz_name ASC").fetchall()
             
-        if not df_leaderboard.empty:
-            st.dataframe(df_leaderboard)
-            csv_data = df_leaderboard.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Download Full Report (.CSV)",
-                data=csv_data,
-                file_name="S5_Stratos_Global_Leaderboard.csv",
-                mime="text/csv"
-            )
+        if all_quizzes_rows:
+            for q_row in all_quizzes_rows:
+                col_name, col_status, col_slack = st.columns([2, 2, 3])
+                
+                with col_name:
+                    st.markdown(f"**{q_row['quiz_name']}** ({len(json.loads(q_row['questions_json']))} Questions)")
+                
+                with col_status:
+                    current_status = "Enabled" if q_row["is_enabled"] == 1 else "Disabled"
+                    toggle_label = "Disable" if q_row["is_enabled"] == 1 else "Enable"
+                    
+                    if st.button(toggle_label, key=f"tgl_{q_row['quiz_name']}"):
+                        new_state = 0 if q_row["is_enabled"] == 1 else 1
+                        with get_db_connection() as conn:
+                            conn.execute("UPDATE quizzes SET is_enabled = ? WHERE quiz_id = ?", (new_state, q_row["quiz_id"]))
+                            conn.commit()
+                        st.rerun()
+                        
+                with col_slack:
+                    # NEW FEATURE 3: COMPILING SLACK FORMATTED ANSWER COPIES
+                    if st.checkbox("Generate Slack Keys", key=f"key_chk_{q_row['quiz_name']}"):
+                        questions_list = json.loads(q_row["questions_json"])
+                        slack_text = f"*Answer Key Report for {q_row['quiz_name']}*\n```\n"
+                        for idx, item in enumerate(questions_list):
+                            slack_text += f"Q{idx+1} (PDF Q{item['pdf_num']}): {item['correct_letter']}) {item['correct']}\n"
+                        slack_text += "```"
+                        st.text_area("Copy Text for Slack:", value=slack_text, height=100, key=f"txt_{q_row['quiz_name']}")
         else:
-            st.info("No records compiled in historical dashboard ledger yet.")
-            
-        # --- DANGER ZONE: EXTENDED ADMINISTRATIVE CLEANUP TASKS ---
+            st.info("No compiled quiz segments found in the local database storage register.")
+
+        # NEW FEATURE 4: EXPORT SLACK FORMATTED LEADERBOARDS
         st.write("---")
-        st.subheader("⚠️ Danger Zone")
-        
-        # Pull live available quiz definitions to display inside target removal dropdowns
+        st.subheader("📋 Leaderboard Exports for Slack Sharing")
         with get_db_connection() as conn:
-            current_quizzes_rows = conn.execute("SELECT quiz_name FROM quizzes").fetchall()
-        list_active_quizzes = [r["quiz_name"] for r in current_quizzes_rows]
-        
-        # NEW FEATURE 1: CLEAR AN EXISTING INDIVIDUAL QUIZ
-        st.markdown("#### Delete an Existing Quiz")
-        if list_active_quizzes:
-            selected_quiz_to_delete = st.selectbox("Select which quiz to permanently remove:", list_active_quizzes, key="del_quiz_select")
-            if st.checkbox(f"I confirm I want to completely delete '{selected_quiz_to_delete}' and all its scoring logs"):
-                if st.button("🗑️ Delete Selected Quiz"):
-                    with get_db_connection() as conn:
-                        # Clear out the quiz configuration metadata
-                        conn.execute("DELETE FROM quizzes WHERE quiz_name = ?", (selected_quiz_to_delete,))
-                        # Clear out student scores bound explicitly to this targeted assessment name
-                        conn.execute("DELETE FROM leaderboard WHERE quiz_name = ?", (selected_quiz_to_delete,))
-                        conn.commit()
-                    st.success(f"Successfully cleared out quiz '{selected_quiz_to_delete}' and clean swept matching logs!")
-                    time.sleep(1)
-                    st.rerun()
-        else:
-            st.info("No deployed quizzes found to delete.")
+            raw_scores = conn.execute("SELECT quiz_name, associate_email, score, total_possible, time_taken_seconds FROM leaderboard ORDER BY score DESC, time_taken_seconds ASC").fetchall()
             
-        st.markdown("---")
-        
-        # FEATURE 2: TOTAL RESET LEADERBOARD PANEL 
-        st.markdown("#### Reset All Scoreboards")
-        st.markdown("Clears out all associate score boards across every deployment while keeping quiz questions intact.")
-        if st.checkbox("I confirm I want to clear the leaderboard data for all quizzes completely"):
-            if st.button("🔴 Wipe Leaderboard History"):
+        if raw_scores:
+            quiz_modules_present = sorted(list(set([r["quiz_name"] for r in raw_scores])))
+            selected_export_mod = st.selectbox("Select quiz score to export for Slack:", quiz_modules_present)
+            
+            slack_board_output = f"*📊 Current Standings Register — {selected_export_mod}*\n"
+            rank_idx = 1
+            for row in raw_scores:
+                if row["quiz_name"] == selected_export_mod:
+                    medal = "🥇" if rank_idx == 1 else "🥈" if rank_idx == 2 else "🥉" if rank_idx == 3 else "▪️"
+                    slack_board_output += f"{medal} *Rank #{rank_idx}* — {row['associate_email']} | Score: `{row['score']}/{row['total_possible']}` | Time: `{row['time_taken_seconds']}s`\n"
+                    rank_idx += 1
+                    
+            st.text_area("Click below to copy and paste directly into Slack:", value=slack_board_output, height=150)
+        else:
+            st.info("No recorded historical scores available to build clipboard streams.")
+
+        st.write("---")
+        st.subheader("🗑️ System Infrastructure Reset")
+        if st.checkbox("Confirm permanent deletion of all Leaderboard historical records"):
+            if st.button("🔴 Wipe System Performance Database"):
                 with get_db_connection() as conn:
                     conn.execute("DELETE FROM leaderboard")
                     conn.commit()
-                st.success("Leaderboard history has been successfully wiped clean!")
-                time.sleep(1)
+                st.success("Leaderboard history has been successfully reset!")
                 st.rerun()
 
-# --- TAB 1: INTERACTIVE RUNTIME ASSOCIATE INTERFACE ---
+# --- TAB 1: RUNTIME ASSOCIATE INTERFACE SYSTEM ---
 with tab_quiz:
-    if not st.session_state.user_name:
-        st.subheader("Associate Onboarding")
-        name_input = st.text_input("Enter Your Full Name to Begin:")
-        if st.button("Launch Profile") and name_input.strip():
-            st.session_state.user_name = name_input.strip()
-            st.rerun()
+    st.markdown("### S5 Stratos Retail Quiz")
+    
+    # FIX: Enforce persistent email profiling verification checks
+    if not st.session_state.user_email:
+        st.subheader("Associate Authentication Entry")
+        email_input = st.text_input("Enter your S5 stratos email id:")
+        if st.button("Establish Session Profile") and email_input.strip():
+            if "@" in email_input and "." in email_input:
+                st.session_state.user_email = email_input.strip().lower()
+                st.rerun()
+            else:
+                st.error("Please enter a valid structured email verification address.")
     else:
-        st.write(f"👤 Associate: **{st.session_state.user_name}**")
-        
+        st.sidebar.markdown(f"👤 Session User: `{st.session_state.user_email}`")
+        if st.sidebar.button("Switch Account Profiler"):
+            st.session_state.user_email = ""
+            st.session_state.quiz_started = False
+            st.session_state.active_quiz_run = None
+            st.rerun()
+
+        # Gather enabled assessments from active DB storage
         with get_db_connection() as conn:
-            quiz_rows = conn.execute("SELECT quiz_id, quiz_name, time_per_q, num_questions FROM quizzes").fetchall()
-            
-        if not quiz_rows:
-            st.info("📢 No evaluation modules have been published by the system administrator yet.")
+            enabled_rows = conn.execute("SELECT * FROM quizzes WHERE is_enabled = 1 ORDER BY quiz_name ASC").fetchall()
+
+        if not enabled_rows:
+            st.info("📢 There are currently no assessment windows open for entry. Please coordinate with the training supervisor.")
         elif not st.session_state.quiz_started:
-            st.subheader("Select Available Assessment Module")
-            quiz_options = {r["quiz_name"]: r for r in quiz_rows}
-            selected_module = st.selectbox("Choose a quiz to start:", list(quiz_options.keys()))
+            st.subheader("Available Assessment Modules")
+            selection_map = {r["quiz_name"]: r for r in enabled_rows}
+            user_choice = st.selectbox("Choose an open module window to execute:", list(selection_map.keys()))
             
+            # Prevent double evaluations across the same user email profile
             with get_db_connection() as conn:
-                existing_attempt = conn.execute(
-                    "SELECT score, time_taken_seconds FROM leaderboard WHERE quiz_name = ? AND associate_name = ?", 
-                    (selected_module, st.session_state.user_name)
+                duplicate_check = conn.execute(
+                    "SELECT score, time_taken_seconds FROM leaderboard WHERE quiz_name = ? AND associate_email = ?",
+                    (user_choice, st.session_state.user_email)
                 ).fetchone()
                 
-            if existing_attempt:
-                st.warning(f"⚠️ You have already submitted this assessment. Registered score: **{existing_attempt['score']}** (Time spent: `{existing_attempt['time_taken_seconds']}s`)")
+            if duplicate_check:
+                st.warning(f"⚠️ Registration Conflict: You have previously submitted entries for this quiz. Confirmed score: **{duplicate_check['score']}** | Duration: `{duplicate_check['time_taken_seconds']}s`")
             else:
-                target_meta = quiz_options[selected_module]
-                total_time_calc = target_meta["num_questions"] * target_meta["time_per_q"]
+                meta_block = selection_map[user_choice]
+                q_array = json.loads(meta_block["questions_json"])
+                calculated_max_time = len(q_array) * meta_block["time_per_q"]
+                
                 st.markdown(f"""
-                **Module Rules:**
-                * Total Questions: `{target_meta['num_questions']}`
-                * Allowed Pacing Pace: `{target_meta['time_per_q']} seconds per question`
-                * Maximum Time Window: `{total_time_calc} seconds total`
+                **Module Operational Framework Parameters:**
+                * Active Assessment Identifier: `{meta_block['quiz_name']}`
+                * Segment Size: `{len(q_array)} Multiple Choice Questions`
+                * Maximum Permitted Session Runway: `{calculated_max_time} Seconds Total`
                 """)
                 
-                if st.button("🚀 Start Examination"):
-                    with get_db_connection() as conn:
-                        chosen_quiz = conn.execute("SELECT * FROM quizzes WHERE quiz_id = ?", (target_meta["quiz_id"],)).fetchone()
-                    
-                    st.session_state.current_quiz = {
-                        "name": chosen_quiz["quiz_name"],
-                        "time_limit": total_time_calc,
-                        "questions": json.loads(chosen_quiz["questions_json"])
-                    }
-                    st.session_state.quiz_started = True
-                    st.session_state.start_time = time.time()
-                    st.rerun()
+                # DETERMINISTIC WINDOW TIMER LOGIC CODES
+                now = datetime.datetime.now()
+                # 0 = Monday, 1 = Tuesday ... 4 = Friday, 5 = Saturday, 6 = Sunday
+                is_weekday = now.weekday() in [0, 1, 2, 3, 4]
+                is_work_hours = 9 <= now.hour < 17  # Explicitly locks operation outside of 09:00 AM - 05:00 PM
+                
+                if not is_weekday or not is_work_hours:
+                    st.error("🔒 Security Lock: This system's quizzes are restricted to execution cycles between Monday and Friday from 09:00 AM to 05:00 PM.")
+                else:
+                    if st.button("🚀 Begin Assessment Session"):
+                        st.session_state.active_quiz_run = {
+                            "name": meta_block["quiz_name"],
+                            "time_limit": calculated_max_time,
+                            "questions": q_array
+                        }
+                        st.session_state.quiz_started = True
+                        st.session_state.start_time = time.time()
+                        st.rerun()
         else:
-            active_data = st.session_state.current_quiz
-            total_limit = active_data["time_limit"]
+            # --- LIVE TESTING EXECUTION MODULE ENGINE ---
+            run_data = st.session_state.active_quiz_run
+            max_seconds = run_data["time_limit"]
             
-            elapsed = int(time.time() - st.session_state.start_time)
-            remaining = total_limit - elapsed
+            seconds_spent = int(time.time() - st.session_state.start_time)
+            remaining_seconds = max_seconds - seconds_spent
             
-            if remaining <= 0:
-                st.error("💥 Time-limit window exceeded! Auto-submitting current answers...")
-                remaining = 0
+            if remaining_seconds <= 0:
+                st.error("💥 System Notification: Allotted runtime limits have expired. Locking choices and computing entries...")
+                remaining_seconds = 0
                 
-            st.metric(label="⌛ Overall Time Remaining", value=f"{remaining} Seconds")
-            
+            st.metric(label="⌛ Time Remaining in Active Module Window", value=f"{remaining_seconds} Seconds")
             st.empty()
-            if remaining > 0:
-                time.sleep(1) 
+            if remaining_seconds > 0:
+                time.sleep(1)
                 
-            quiz_form = st.form(key="active_test_form")
-            user_selections = {}
+            test_form = st.form(key="live_evaluation_form_block")
+            choices_map = {}
             
-            for idx, q_meta in enumerate(active_data["questions"]):
-                quiz_form.markdown(f"**Question {idx+1}:** {q_meta['question']}")
-                
-                form_choices = ["Select an option..."] + q_meta["options"]
-                user_selections[idx] = quiz_form.selectbox(
-                    "Choose the correct option:",
-                    form_choices,
-                    key=f"user_sel_{idx}"
+            for index, q_obj in enumerate(run_data["questions"]):
+                test_form.markdown(f"**Question {index+1}:** {q_obj['question']}")
+                options_selections = ["Select an option..."] + q_obj["options"]
+                choices_map[index] = test_form.selectbox(
+                    "Choose the correct conceptual option:",
+                    options_selections,
+                    key=f"associate_choice_{index}"
                 )
-                quiz_form.markdown("---")
+                test_form.markdown("---")
                 
-            submit_trigger = quiz_form.form_submit_button("Lock In & Submit Answers")
-            
-            if submit_trigger or remaining <= 0:
-                actual_time_spent = int(time.time() - st.session_state.start_time)
-                if actual_time_spent > total_limit:
-                    actual_time_spent = total_limit
-
-                final_score = 0
-                for idx, q_meta in enumerate(active_data["questions"]):
-                    if user_selections[idx] == q_meta["correct"]:
-                        final_score += 1
+            if test_form.form_submit_button("Finalize Assessment & Log Score") or remaining_seconds <= 0:
+                total_duration = int(time.time() - st.session_state.start_time)
+                if total_duration > max_seconds:
+                    total_duration = max_seconds
+                    
+                points = 0
+                for index, q_obj in enumerate(run_data["questions"]):
+                    if choices_map[index] == q_obj["correct"]:
+                        points += 1
                         
                 with get_db_connection() as conn:
                     conn.execute(
-                        "INSERT INTO leaderboard (quiz_name, associate_name, score, total_possible, time_taken_seconds) VALUES (?, ?, ?, ?, ?)",
-                        (active_data["name"], st.session_state.user_name, final_score, len(active_data["questions"]), actual_time_spent)
+                        "INSERT INTO leaderboard (quiz_name, associate_email, score, total_possible, time_taken_seconds) VALUES (?, ?, ?, ?, ?)",
+                        (run_data["name"], st.session_state.user_email, points, len(run_data["questions"]), total_duration)
                     )
                     conn.commit()
-                
+                    
                 st.balloons()
-                st.success(f"Assessment complete! Score written to central storage: {final_score} / {len(active_data['questions'])} (Completed in {actual_time_spent} seconds)")
+                st.success(f"Assessment Complete! Registered Score: {points}/{len(run_data['questions'])} within {total_duration}s.")
                 
                 st.session_state.quiz_started = False
-                st.session_state.current_quiz = None
+                st.session_state.active_quiz_run = None
                 if "start_time" in st.session_state:
                     del st.session_state.start_time
                 st.button("Return to Module Directory")
 
-    # --- REAL-TIME PORTAL LEADERBOARD REGISTER ---
+    # --- NEW FEATURE 4: TIME-SEGMENTED METRIC LEADERBOARDS ---
     st.write("---")
-    st.subheader("📊 Current Module Standings")
+    st.subheader("📊 Dynamic Global Standings")
     
-    # NEW LOGIC LAYER FOR THE TIEBREAKER RANKS:
-    # SQL query orders first by SCORE DESCENDING (Highest wins), then by TIME_TAKEN_SECONDS ASCENDING (Lowest wins)
+    # Read scoreboards with tiebreaker prioritization logic built-in (Score DESC, Time spent ASC)
     with get_db_connection() as conn:
-        all_scores = conn.execute(
-            "SELECT quiz_name, associate_name, score, total_possible, time_taken_seconds FROM leaderboard ORDER BY score DESC, time_taken_seconds ASC, timestamp ASC"
-        ).fetchall()
+        db_scores = conn.execute("""
+            SELECT quiz_name, associate_email, score, total_possible, time_taken_seconds, timestamp 
+            FROM leaderboard 
+            ORDER BY score DESC, time_taken_seconds ASC, timestamp ASC
+        """).fetchall()
         
-    if all_scores:
-        modules_tracked = set([row["quiz_name"] for row in all_scores])
-        for mod in modules_tracked:
-            with st.expander(f"🏆 Rankings: {mod}", expanded=True):
-                rank = 1
-                for row in all_scores:
-                    if row["quiz_name"] == mod:
-                        medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else "🔹"
-                        st.markdown(f"{medal} **Rank #{rank}** — {row['associate_name']} : `{row['score']} / {row['total_possible']} Points` (Time: `{row['time_taken_seconds']}s`)")
-                        rank += 1
+    if db_scores:
+        view_mode = st.radio("Group Standings Filter Tier:", ["Per Active Quiz Module", "Weekly Cumulative Performance", "Monthly Cumulative Performance"], horizontal=True)
+        
+        now_dt = datetime.datetime.now()
+        
+        if view_mode == "Per Active Quiz Module":
+            distinct_quizzes = sorted(list(set([r["quiz_name"] for r in db_scores])))
+            for q_name in distinct_quizzes:
+                with st.expander(f"🏆 Rankings: {q_name}", expanded=True):
+                    r_idx = 1
+                    for r in db_scores:
+                        if r["quiz_name"] == q_name:
+                            mdl = "🥇" if r_idx == 1 else "🥈" if r_idx == 2 else "🥉" if r_idx == 3 else "🔹"
+                            st.markdown(f"{mdl} **Rank #{r_idx}** — {r['associate_email']} : `{r['score']}/{r['total_possible']} Pts` (Time: `{r['time_taken_seconds']}s`)")
+                            r_idx += 1
+                            
+        elif view_mode == "Weekly Cumulative Performance":
+            # Tracks rows matching the current calendar week identifier
+            st.caption("Aggregated cumulative point scoring profiles matching the current week row logs.")
+            weekly_totals = {}
+            current_week_num = now_dt.isocalendar()[1]
+            current_year_num = now_dt.year
+            
+            for r in db_scores:
+                row_dt = datetime.datetime.strptime(r["timestamp"], "%Y-%m-%d %H:%M:%S")
+                if row_dt.isocalendar()[1] == current_week_num and row_dt.year == current_year_num:
+                    email = r["associate_email"]
+                    if email not in weekly_totals:
+                        weekly_totals[email] = {"score": 0, "time": 0}
+                    weekly_totals[email]["score"] += r["score"]
+                    weekly_totals[email]["time"] += r["time_taken_seconds"]
+            
+            sorted_weekly = sorted(weekly_totals.items(), key=lambda x: (-x[1]["score"], x[1]["time"]))
+            
+            for w_idx, (email, metrics) in enumerate(sorted_weekly):
+                mdl = "🥇" if w_idx == 0 else "🥈" if w_idx == 1 else "🥉" if w_idx == 2 else "🔹"
+                st.markdown(f"{mdl} **Rank #{w_idx+1}** — {email} : `{metrics['score']} Total Correct Answers` (Total Time: `{metrics['time']}s`)")
+                
+        elif view_mode == "Monthly Cumulative Performance":
+            st.caption("Aggregated point rankings matched against the current month cycle ledger.")
+            monthly_totals = {}
+            current_month = now_dt.month
+            current_year = now_dt.year
+            
+            for r in db_scores:
+                row_dt = datetime.datetime.strptime(r["timestamp"], "%Y-%m-%d %H:%M:%S")
+                if row_dt.month == current_month and row_dt.year == current_year:
+                    email = r["associate_email"]
+                    if email not in monthly_totals:
+                        monthly_totals[email] = {"score": 0, "time": 0}
+                    monthly_totals[email]["score"] += r["score"]
+                    monthly_totals[email]["time"] += r["time_taken_seconds"]
+                    
+            sorted_monthly = sorted(monthly_totals.items(), key=lambda x: (-x[1]["score"], x[1]["time"]))
+            
+            for m_idx, (email, metrics) in enumerate(sorted_monthly):
+                mdl = "🥇" if m_idx == 0 else "🥈" if m_idx == 1 else "🥉" if m_idx == 2 else "🔹"
+                st.markdown(f"{mdl} **Rank #{m_idx+1}** — {email} : `{metrics['score']} Total Correct Answers` (Total Time: `{metrics['time']}s`)")
     else:
         st.info("No associate results recorded yet.")
