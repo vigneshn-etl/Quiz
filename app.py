@@ -223,7 +223,7 @@ with tab_admin:
         with st.form("admin_login"):
             u = st.text_input("Username")
             p = st.text_input("Password", type="password")
-            if st.form_submit_button("Authenticate Portal") and u == "admin" and p == "admin":
+            if st.form_submit_button("Authenticate Portal") and u == "admin" and p == "555tratos":
                 st.session_state.admin_logged_in = True
                 st.rerun()
     else:
