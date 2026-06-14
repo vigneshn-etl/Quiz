@@ -10,7 +10,7 @@ import streamlit as st
 
 st.set_page_config(page_title="S5 Stratos Retail Quiz", layout="centered")
 
-# --- DATABASE LAYER & CONFIGURATION ---
+# --- DATABASE LAYER & ROBUST CONFIGURATION ---
 DB_FILE = "quiz_data.db"
 
 def get_db_connection():
@@ -19,7 +19,7 @@ def get_db_connection():
     return conn
 
 def init_db():
-    """Initializes schema to handle sequential multi-quiz blocks and multi-tier leaderboards."""
+    """Initializes schema to handle sequential multi-quiz blocks and clears structure anomalies."""
     with get_db_connection() as conn:
         # Table to store generated quiz segments
         conn.execute("""
@@ -31,25 +31,48 @@ def init_db():
                 time_per_q INTEGER DEFAULT 20
             )
         """)
-        # Table to store associate execution tracking logs
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS leaderboard (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                quiz_name TEXT,
-                associate_email TEXT,
-                score INTEGER,
-                total_possible INTEGER,
-                time_taken_seconds INTEGER,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+        
+        # Safe table execution reset
+        try:
+            # Table to store associate execution tracking logs
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS leaderboard (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    quiz_name TEXT,
+                    associate_email TEXT,
+                    score INTEGER,
+                    total_possible INTEGER,
+                    time_taken_seconds INTEGER,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Verify columns directly to completely eliminate SQLite Operational Errors
+            cursor = conn.execute("PRAGMA table_info(leaderboard)")
+            columns = [row["name"] for row in cursor.fetchall()]
+            if "time_taken_seconds" not in columns:
+                conn.execute("ALTER TABLE leaderboard ADD COLUMN time_taken_seconds INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            # If the database file is corrupted or structurally locked, drop and rebuild clean
+            conn.execute("DROP TABLE IF EXISTS leaderboard")
+            conn.execute("""
+                CREATE TABLE leaderboard (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    quiz_name TEXT,
+                    associate_email TEXT,
+                    score INTEGER,
+                    total_possible INTEGER,
+                    time_taken_seconds INTEGER,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
         conn.commit()
 
 init_db()
 
-# --- DETERMINISTIC PDF CHUNK PARSER ---
+# --- HIGHLY FLEXIBLE & RESILIENT S5 STRATOS PDF PARSER ---
 def parse_and_split_pdf(pdf_file, q_per_quiz, time_limit_q):
-    """Parses full PDF sequentially and chunks questions into Quiz 001, Quiz 002... without overlap."""
+    """Parses full PDF sequentially using loose text boundaries to account for spacing differences."""
     try:
         reader = pypdf.PdfReader(pdf_file)
         full_text = ""
@@ -62,46 +85,64 @@ def parse_and_split_pdf(pdf_file, q_per_quiz, time_limit_q):
             st.error("No readable text layers detected inside the target PDF.")
             return False
 
-        # Parse Answer Key Mapping Matrix
+        # 1. Parse Answer Key from the back using loose spacing tolerances
         answer_key_map = {}
-        ans_pattern = re.compile(r"Q\??(\d+):\s*([A-D])")
+        # Matches patterns like Q001: B, Q1: A, Q151: B with any number of spaces
+        ans_pattern = re.compile(r"Q\??0*(\d+):\s*([A-D])", re.IGNORECASE)
         for match in ans_pattern.finditer(full_text):
-            answer_key_map[int(match.group(1))] = match.group(2)
+            q_num = int(match.group(1))
+            correct_letter = match.group(2).upper()
+            answer_key_map[q_num] = correct_letter
 
-        # Parse out all individual question structures sequentially
-        q_blocks = re.split(r"(?=Q\d+\.)", full_text)
-        all_ordered_questions = []
-
-        # Sort blocks sequentially by their parsed index number
-        sorted_blocks = []
-        for block in q_blocks:
-            if not block.strip().startswith("Q"):
-                continue
-            num_match = re.search(r"^Q(\d+)\.", block)
-            if num_match:
-                sorted_blocks.append((int(num_match.group(1)), block))
+        # 2. Tokenize questions based on Q followed by numbers and a delimiter (dot, space, bracket)
+        # Regex split catches 'Q1.', 'Q 1.', 'Q150.' dynamically
+        q_blocks = re.split(r"(?=Q\s*\d+\s*[\.\s\]\)])", full_text)
         
-        sorted_blocks.sort(key=lambda x: x[0])
+        all_ordered_questions = []
+        
+        for block in q_blocks:
+            cleaned_block = block.strip()
+            if not cleaned_block.startswith("Q"):
+                continue
+                
+            # Isolate the index identification number
+            num_match = re.match(r"^Q\s*(\d+)", cleaned_block, re.IGNORECASE)
+            if not num_match:
+                continue
+            q_id = int(num_match.group(1))
 
-        for q_id, block in sorted_blocks:
-            lines = [line.strip() for line in block.split("\n") if line.strip()]
+            # Split lines cleanly and ignore watermark headers
+            lines = [line.strip() for line in cleaned_block.split("\n") if line.strip()]
+            
             question_text = ""
             options_dict = {}
             
+            # Read line item sequences
             for line in lines:
-                if line.startswith(f"Q{q_id}."):
-                    question_text = re.sub(r"\[.*?\]", "", line).replace(f"Q{q_id}.", "").strip()
-                elif line.startswith("A."):
-                    options_dict["A"] = line.replace("A.", "").strip()
-                elif line.startswith("B."):
-                    options_dict["B"] = line.replace("B.", "").strip()
-                elif line.startswith("C."):
-                    options_dict["C"] = line.replace("C.", "").strip()
-                elif line.startswith("D."):
-                    options_dict["D"] = line.replace("D.", "").strip()
-                elif not question_text and not line.startswith(("A.", "B.", "C.", "D.")) and "S5 Stratos" not in line:
-                    question_text += " " + line
+                # Filter out operational branding footnotes
+                if "S5 Stratos" in line and ("Operations" in line or "Training" in line or "Page" in line or "Practice Questions" in line):
+                    continue
+                
+                # Loose detection for choices (A., A), B., B))
+                if re.match(r"^[A]\s*[\.\s\)]", line, re.IGNORECASE):
+                    options_dict["A"] = re.sub(r"^[A]\s*[\.\s\)]", "", line).strip()
+                elif re.match(r"^[B]\s*[\.\s\)]", line, re.IGNORECASE):
+                    options_dict["B"] = re.sub(r"^[B]\s*[\.\s\)]", "", line).strip()
+                elif re.match(r"^[C]\s*[\.\s\)]", line, re.IGNORECASE):
+                    options_dict["C"] = re.sub(r"^[C]\s*[\.\s\)]", "", line).strip()
+                elif re.match(r"^[D]\s*[\.\s\)]", line, re.IGNORECASE):
+                    options_dict["D"] = re.sub(r"^[D]\s*[\.\s\)]", "", line).strip()
+                else:
+                    # Strip out initial metadata tags to keep question content pristine
+                    cleaned_line = re.sub(r"^Q\s*\d+\s*[\.\s\]\)]", "", line, flags=re.IGNORECASE)
+                    cleaned_line = re.sub(r"\[.*?\]", "", cleaned_line).strip()
+                    if cleaned_line:
+                        if not question_text:
+                            question_text = cleaned_line
+                        else:
+                            question_text += " " + cleaned_line
 
+            # Fallback evaluation matching if answer key contains the index
             if len(options_dict) >= 2 and q_id in answer_key_map:
                 correct_letter = answer_key_map[q_id]
                 correct_text_option = options_dict.get(correct_letter, "")
@@ -116,16 +157,18 @@ def parse_and_split_pdf(pdf_file, q_per_quiz, time_limit_q):
                         "correct_letter": correct_letter
                     })
 
+        # Final tracking assembly validation
         if not all_ordered_questions:
-            st.error("Could not construct structured segments from target document mapping tokens.")
+            st.error("Could not construct structured segments from target document mapping tokens. Ensure your PDF matches standard question layout specifications.")
             return False
 
-        # Sequential Chunk Splitting Logic Execution
+        # Sort everything sequentially by original index before chunk partitioning
+        all_ordered_questions.sort(key=lambda x: x["pdf_num"])
+
         total_extracted = len(all_ordered_questions)
         quiz_counter = 1
         
         with get_db_connection() as conn:
-            # Clear historical quiz setups prior to running a full partition reset
             conn.execute("DELETE FROM quizzes")
             
             for i in range(0, total_extracted, q_per_quiz):
@@ -139,7 +182,7 @@ def parse_and_split_pdf(pdf_file, q_per_quiz, time_limit_q):
                 quiz_counter += 1
             conn.commit()
             
-        st.success(f"Successfully split {total_extracted} questions into {quiz_counter - 1} distinct evaluation segments!")
+        st.success(f"Success! Segmented {total_extracted} questions cleanly into {quiz_counter - 1} separate evaluation modules.")
         return True
     except Exception as e:
         st.error(f"Partition setup execution crash: {e}")
@@ -179,11 +222,13 @@ with tab_admin:
         
         adm_q_per_quiz = st.number_input("Questions per quiz segment:", min_value=5, max_value=50, value=25)
         adm_time_per_q = st.number_input("Time allocation per question (seconds):", min_value=5, max_value=120, value=20)
-        source_file = st.file_uploader("Upload 'S5_Stratos_250_Questions.pdf'", type="pdf")
+        source_file = st.file_uploader("Upload Question Bank PDF File", type="pdf")
         
         if st.button("Parse and Construct Sequential Quizzes") and source_file:
-            if parse_and_split_pdf(source_file, adm_q_per_quiz, adm_time_per_q):
-                st.rerun()
+            with st.spinner("Executing dynamic structural mapping..."):
+                if parse_and_split_pdf(source_file, adm_q_per_quiz, adm_time_per_q):
+                    time.sleep(1)
+                    st.rerun()
 
         st.write("---")
         st.subheader("🔓 Step 2: Manage Quiz Availability & Fetch Slack Output")
@@ -210,7 +255,6 @@ with tab_admin:
                         st.rerun()
                         
                 with col_slack:
-                    # NEW FEATURE 3: COMPILING SLACK FORMATTED ANSWER COPIES
                     if st.checkbox("Generate Slack Keys", key=f"key_chk_{q_row['quiz_name']}"):
                         questions_list = json.loads(q_row["questions_json"])
                         slack_text = f"*Answer Key Report for {q_row['quiz_name']}*\n```\n"
@@ -219,9 +263,8 @@ with tab_admin:
                         slack_text += "```"
                         st.text_area("Copy Text for Slack:", value=slack_text, height=100, key=f"txt_{q_row['quiz_name']}")
         else:
-            st.info("No compiled quiz segments found in the local database storage register.")
+            st.info("No compiled quiz segments found in local storage.")
 
-        # NEW FEATURE 4: EXPORT SLACK FORMATTED LEADERBOARDS
         st.write("---")
         st.subheader("📋 Leaderboard Exports for Slack Sharing")
         with get_db_connection() as conn:
@@ -241,11 +284,11 @@ with tab_admin:
                     
             st.text_area("Click below to copy and paste directly into Slack:", value=slack_board_output, height=150)
         else:
-            st.info("No recorded historical scores available to build clipboard streams.")
+            st.info("No recorded historical scores available.")
 
         st.write("---")
         st.subheader("🗑️ System Infrastructure Reset")
-        if st.checkbox("Confirm permanent deletion of all Leaderboard historical records"):
+        if st.checkbox("Confirm permanent deletion of all Leaderboard records"):
             if st.button("🔴 Wipe System Performance Database"):
                 with get_db_connection() as conn:
                     conn.execute("DELETE FROM leaderboard")
@@ -257,7 +300,6 @@ with tab_admin:
 with tab_quiz:
     st.markdown("### S5 Stratos Retail Quiz")
     
-    # FIX: Enforce persistent email profiling verification checks
     if not st.session_state.user_email:
         st.subheader("Associate Authentication Entry")
         email_input = st.text_input("Enter your S5 stratos email id:")
@@ -266,7 +308,7 @@ with tab_quiz:
                 st.session_state.user_email = email_input.strip().lower()
                 st.rerun()
             else:
-                st.error("Please enter a valid structured email verification address.")
+                st.error("Please enter a valid email address.")
     else:
         st.sidebar.markdown(f"👤 Session User: `{st.session_state.user_email}`")
         if st.sidebar.button("Switch Account Profiler"):
@@ -275,7 +317,6 @@ with tab_quiz:
             st.session_state.active_quiz_run = None
             st.rerun()
 
-        # Gather enabled assessments from active DB storage
         with get_db_connection() as conn:
             enabled_rows = conn.execute("SELECT * FROM quizzes WHERE is_enabled = 1 ORDER BY quiz_name ASC").fetchall()
 
@@ -286,7 +327,6 @@ with tab_quiz:
             selection_map = {r["quiz_name"]: r for r in enabled_rows}
             user_choice = st.selectbox("Choose an open module window to execute:", list(selection_map.keys()))
             
-            # Prevent double evaluations across the same user email profile
             with get_db_connection() as conn:
                 duplicate_check = conn.execute(
                     "SELECT score, time_taken_seconds FROM leaderboard WHERE quiz_name = ? AND associate_email = ?",
@@ -294,7 +334,7 @@ with tab_quiz:
                 ).fetchone()
                 
             if duplicate_check:
-                st.warning(f"⚠️ Registration Conflict: You have previously submitted entries for this quiz. Confirmed score: **{duplicate_check['score']}** | Duration: `{duplicate_check['time_taken_seconds']}s`")
+                st.warning(f"⚠️ Registration Conflict: You have already submitted entries for this quiz. Confirmed score: **{duplicate_check['score']}** | Duration: `{duplicate_check['time_taken_seconds']}s`")
             else:
                 meta_block = selection_map[user_choice]
                 q_array = json.loads(meta_block["questions_json"])
@@ -307,11 +347,10 @@ with tab_quiz:
                 * Maximum Permitted Session Runway: `{calculated_max_time} Seconds Total`
                 """)
                 
-                # DETERMINISTIC WINDOW TIMER LOGIC CODES
+                # DETERMINISTIC TIME-LOCK LOGIC FOR MON-FRI (09:00 AM - 05:00 PM)
                 now = datetime.datetime.now()
-                # 0 = Monday, 1 = Tuesday ... 4 = Friday, 5 = Saturday, 6 = Sunday
                 is_weekday = now.weekday() in [0, 1, 2, 3, 4]
-                is_work_hours = 9 <= now.hour < 17  # Explicitly locks operation outside of 09:00 AM - 05:00 PM
+                is_work_hours = 9 <= now.hour < 17 
                 
                 if not is_weekday or not is_work_hours:
                     st.error("🔒 Security Lock: This system's quizzes are restricted to execution cycles between Monday and Friday from 09:00 AM to 05:00 PM.")
@@ -334,7 +373,7 @@ with tab_quiz:
             remaining_seconds = max_seconds - seconds_spent
             
             if remaining_seconds <= 0:
-                st.error("💥 System Notification: Allotted runtime limits have expired. Locking choices and computing entries...")
+                st.error("💥 runtime limits have expired! Locking entries...")
                 remaining_seconds = 0
                 
             st.metric(label="⌛ Time Remaining in Active Module Window", value=f"{remaining_seconds} Seconds")
@@ -349,7 +388,7 @@ with tab_quiz:
                 test_form.markdown(f"**Question {index+1}:** {q_obj['question']}")
                 options_selections = ["Select an option..."] + q_obj["options"]
                 choices_map[index] = test_form.selectbox(
-                    "Choose the correct conceptual option:",
+                    "Choose the correct option:",
                     options_selections,
                     key=f"associate_choice_{index}"
                 )
@@ -381,11 +420,10 @@ with tab_quiz:
                     del st.session_state.start_time
                 st.button("Return to Module Directory")
 
-    # --- NEW FEATURE 4: TIME-SEGMENTED METRIC LEADERBOARDS ---
+    # --- TIME-SEGMENTED METRIC LEADERBOARDS ---
     st.write("---")
     st.subheader("📊 Dynamic Global Standings")
     
-    # Read scoreboards with tiebreaker prioritization logic built-in (Score DESC, Time spent ASC)
     with get_db_connection() as conn:
         db_scores = conn.execute("""
             SELECT quiz_name, associate_email, score, total_possible, time_taken_seconds, timestamp 
@@ -395,7 +433,6 @@ with tab_quiz:
         
     if db_scores:
         view_mode = st.radio("Group Standings Filter Tier:", ["Per Active Quiz Module", "Weekly Cumulative Performance", "Monthly Cumulative Performance"], horizontal=True)
-        
         now_dt = datetime.datetime.now()
         
         if view_mode == "Per Active Quiz Module":
@@ -410,8 +447,7 @@ with tab_quiz:
                             r_idx += 1
                             
         elif view_mode == "Weekly Cumulative Performance":
-            # Tracks rows matching the current calendar week identifier
-            st.caption("Aggregated cumulative point scoring profiles matching the current week row logs.")
+            st.caption("Aggregated points matched against the current week.")
             weekly_totals = {}
             current_week_num = now_dt.isocalendar()[1]
             current_year_num = now_dt.year
@@ -426,13 +462,12 @@ with tab_quiz:
                     weekly_totals[email]["time"] += r["time_taken_seconds"]
             
             sorted_weekly = sorted(weekly_totals.items(), key=lambda x: (-x[1]["score"], x[1]["time"]))
-            
             for w_idx, (email, metrics) in enumerate(sorted_weekly):
                 mdl = "🥇" if w_idx == 0 else "🥈" if w_idx == 1 else "🥉" if w_idx == 2 else "🔹"
-                st.markdown(f"{mdl} **Rank #{w_idx+1}** — {email} : `{metrics['score']} Total Correct Answers` (Total Time: `{metrics['time']}s`)")
+                st.markdown(f"{mdl} **Rank #{w_idx+1}** — {email} : `{metrics['score']} Total Correct` (Time: `{metrics['time']}s`)")
                 
         elif view_mode == "Monthly Cumulative Performance":
-            st.caption("Aggregated point rankings matched against the current month cycle ledger.")
+            st.caption("Aggregated points matched against the current calendar month.")
             monthly_totals = {}
             current_month = now_dt.month
             current_year = now_dt.year
@@ -447,9 +482,8 @@ with tab_quiz:
                     monthly_totals[email]["time"] += r["time_taken_seconds"]
                     
             sorted_monthly = sorted(monthly_totals.items(), key=lambda x: (-x[1]["score"], x[1]["time"]))
-            
             for m_idx, (email, metrics) in enumerate(sorted_monthly):
                 mdl = "🥇" if m_idx == 0 else "🥈" if m_idx == 1 else "🥉" if m_idx == 2 else "🔹"
-                st.markdown(f"{mdl} **Rank #{m_idx+1}** — {email} : `{metrics['score']} Total Correct Answers` (Total Time: `{metrics['time']}s`)")
+                st.markdown(f"{mdl} **Rank #{m_idx+1}** — {email} : `{metrics['score']} Total Correct` (Time: `{metrics['time']}s`)")
     else:
-        st.info("No associate results recorded yet.")
+        st.info("No recorded associate scores available.")
